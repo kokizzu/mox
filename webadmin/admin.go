@@ -929,6 +929,11 @@ EOF
 				instr += fmt.Sprintf("\t_25._tcp.%s. TLSA %s\n", pubDom.ASCII, r)
 			}
 			addf(&r.DANE.Instructions, instr)
+		} else {
+			addf(&r.DANE.Warnings, "DANE not configured: no static TLS host keys.")
+
+			instr := "Add static TLS keys for use with DANE to mox.conf under: Listeners, public, TLS, HostPrivateKeyFiles.\n\nIf automatic TLS certificate management with ACME is configured, run \"mox config ensureacmehostprivatekeys\" to generate static TLS keys and to print a snippet for \"HostPrivateKeyFiles\" for inclusion in mox.conf.\n\nIf TLS keys and certificates are managed externally, configure the TLS keys manually under \"HostPrivateKeyFiles\" in mox.conf, and make sure new TLS keys are not generated for each new certificate (look for an option to \"reuse private keys\" when doing ACME). Important: Before using new TLS keys, corresponding new DANE (TLSA) DNS records must be published (taking TTL into account to let the previous records expire). Using new TLS keys without updating DANE (TLSA) DNS records will cause DANE verification failures, breaking incoming deliveries.\n\nWith \"HostPrivateKeyFiles\" configured, DNS records for DANE based on those TLS keys will be suggested, and future DNS checks will look for those DNS records. Once those DNS records are published, DANE is active for all domains with an MX record pointing to the host."
+			addf(&r.DANE.Instructions, instr)
 		}
 	}()
 
@@ -940,7 +945,12 @@ EOF
 		defer wg.Done()
 
 		// Verify a domain with the configured IPs that do SMTP.
-		verifySPF := func(kind string, domain dns.Domain) (string, *SPFRecord, spf.Record) {
+		verifySPF := func(isHost bool, domain dns.Domain) (string, *SPFRecord, spf.Record) {
+			kind := "domain"
+			if isHost {
+				kind = "host"
+			}
+
 			_, txt, record, _, err := spf.Lookup(ctx, log.Logger, resolver, domain)
 			if err != nil {
 				addf(&r.SPF.Errors, "Looking up %s SPF record: %s", kind, err)
@@ -981,36 +991,27 @@ EOF
 				}
 			}
 
-			for _, l := range mox.Conf.Static.Listeners {
-				if !l.SMTP.Enabled || l.IPsNATed {
-					continue
-				}
-				ips := l.IPs
-				if len(l.NATIPs) > 0 {
-					ips = l.NATIPs
-				}
-				for _, ipstr := range ips {
-					ip := net.ParseIP(ipstr)
-					checkSPFIP(ip)
-				}
-			}
-			for _, t := range mox.Conf.Static.Transports {
-				if t.Socks != nil {
-					for _, ip := range t.Socks.IPs {
-						checkSPFIP(ip)
-					}
-				}
+			for _, ip := range mox.DomainSPFIPs() {
+				checkSPFIP(ip)
 			}
 
-			spfr.Directives = append(spfr.Directives, spf.Directive{Qualifier: "-", Mechanism: "all"})
+			if !isHost {
+				spfr.Directives = append(spfr.Directives, spf.Directive{Mechanism: "mx"})
+			}
+
+			qual := "~"
+			if isHost {
+				qual = "-"
+			}
+			spfr.Directives = append(spfr.Directives, spf.Directive{Qualifier: qual, Mechanism: "all"})
 			return txt, xrecord, spfr
 		}
 
 		// Check SPF record for domain.
 		var dspfr spf.Record
-		r.SPF.DomainTXT, r.SPF.DomainRecord, dspfr = verifySPF("domain", domain)
+		r.SPF.DomainTXT, r.SPF.DomainRecord, dspfr = verifySPF(false, domain)
 		// todo: possibly check all hosts for MX records? assuming they are also sending mail servers.
-		r.SPF.HostTXT, r.SPF.HostRecord, _ = verifySPF("host", mox.Conf.Static.HostnameDomain)
+		r.SPF.HostTXT, r.SPF.HostRecord, _ = verifySPF(true, mox.Conf.Static.HostnameDomain)
 
 		dtxt, err := dspfr.Record()
 		if err != nil {
@@ -1098,7 +1099,7 @@ EOF
 				addf(&r.DKIM.Errors, "Making DKIM record for instructions: %s", err)
 				continue
 			}
-			instr += fmt.Sprintf("\n\t%s._domainkey TXT %s\n", sel, mox.TXTStrings(txt))
+			instr += fmt.Sprintf("\n\t%s._domainkey.%s TXT %s\n", sel, domain.ASCII+".", mox.TXTStrings(txt))
 		}
 		if instr != "" {
 			instr = "Ensure the following DNS record(s) exists, so mail servers receiving emails from this domain can verify the signatures in the mail headers:\n" + instr
@@ -1178,7 +1179,7 @@ EOF
 		} else {
 			addf(&r.DMARC.Instructions, `Configure a DMARC destination in domain in config file.`)
 		}
-		instr := fmt.Sprintf("Ensure a DNS TXT record like the following exists:\n\n\t_dmarc TXT %s\n\nYou can start with testing mode by replacing p=reject with p=none. You can also request for the policy to be applied to a percentage of emails instead of all, by adding pct=X, with X between 0 and 100. Keep in mind that receiving mail servers will apply some anti-spam assessment regardless of the policy and whether it is applied to the message. The ruf= part requests daily aggregate reports to be sent to the specified address, which is automatically configured and reports automatically analyzed.", mox.TXTStrings(dmarcr.String()))
+		instr := fmt.Sprintf("Ensure a DNS TXT record like the following exists:\n\n\t_dmarc.%s TXT %s\n\nYou can start with testing mode by replacing p=reject with p=none. You can also request for the policy to be applied to a percentage of emails instead of all, by adding pct=X, with X between 0 and 100. Keep in mind that receiving mail servers will apply some anti-spam assessment regardless of the policy and whether it is applied to the message. The ruf= part requests daily aggregate reports to be sent to the specified address, which is automatically configured and reports automatically analyzed.", domain.ASCII+".", mox.TXTStrings(dmarcr.String()))
 		addf(&r.DMARC.Instructions, instr)
 		if extInstr != "" {
 			addf(&r.DMARC.Instructions, extInstr)
@@ -1216,8 +1217,9 @@ EOF
 
 Ensure a DNS TXT record like the following exists:
 
-	_smtp._tls TXT %s
-`, mox.TXTStrings(tlsrptr.String()))
+	_smtp._tls.%s TXT %s
+
+`, dom.ASCII+".", mox.TXTStrings(tlsrptr.String()))
 
 			if err == nil {
 				found := false
@@ -1334,14 +1336,14 @@ When enabling MTA-STS, or updating a policy, always update the policy first (thr
 
 		addf(&r.MTASTS.Instructions, `Enable a policy through the configuration file. For new deployments, it is best to start with mode "testing" while enabling TLSRPT. Start with a short "max_age", so updates to your policy are picked up quickly. When confidence in the deployment is high enough, switch to "enforce" mode and a longer "max age". A max age in the order of weeks is recommended. If you foresee a change to your setup in the future, requiring different policies or MX records, you may want to dial back the "max age" ahead of time, similar to how you would handle TTL's in DNS record updates.`)
 
-		host := fmt.Sprintf("Ensure DNS CNAME/A/AAAA records exist that resolve mta-sts.%s to this mail server. For example:\n\n\t%s CNAME %s\n\n", domain.ASCII, "mta-sts."+domain.ASCII+".", mox.Conf.Static.HostnameDomain.ASCII+".")
+		host := fmt.Sprintf("Ensure DNS CNAME/A/AAAA records exist that resolves mta-sts.%s to this mail server. For example:\n\n\tmta-sts.%s CNAME %s\n\n", domain.ASCII, domain.ASCII+".", mox.Conf.Static.HostnameDomain.ASCII+".")
 		addf(&r.MTASTS.Instructions, host)
 
 		mtastsr := mtasts.Record{
 			Version: "STSv1",
 			ID:      time.Now().Format("20060102T150405"),
 		}
-		dns := fmt.Sprintf("Ensure a DNS TXT record like the following exists:\n\n\t_mta-sts TXT %s\n\nConfigure the ID in the configuration file, it must be of the form [a-zA-Z0-9]{1,31}. It represents the version of the policy. For each policy change, you must change the ID to a new unique value. You could use a timestamp like 20220621T123000. When this field exists, an SMTP server will fetch a policy at https://mta-sts.%s/.well-known/mta-sts.txt. This policy is served by mox.", mox.TXTStrings(mtastsr.String()), domain.Name())
+		dns := fmt.Sprintf("Ensure a DNS TXT record like the following exists:\n\n\t_mta-sts.%s TXT %s\n\nConfigure the ID in the configuration file, it must be of the form [a-zA-Z0-9]{1,31}. It represents the version of the policy. For each policy change, you must change the ID to a new unique value. You could use a timestamp like 20220621T123000. When this field exists, an SMTP server will fetch a policy at https://mta-sts.%s/.well-known/mta-sts.txt. This policy is served by mox.", domain.ASCII+".", mox.TXTStrings(mtastsr.String()), domain.Name())
 		addf(&r.MTASTS.Instructions, dns)
 	}()
 
@@ -1403,7 +1405,11 @@ When enabling MTA-STS, or updating a policy, always update the policy first (thr
 			if err != nil {
 				addf(&r.SRVConf.Errors, "Looking up SRV record %q: %s", name, err)
 			} else if len(req.srvs) == 0 {
-				addf(&r.SRVConf.Errors, "Missing SRV record %q", name)
+				if req.host == "." {
+					addf(&r.SRVConf.Warnings, "Missing optional SRV record %q", name)
+				} else {
+					addf(&r.SRVConf.Errors, "Missing SRV record %q", name)
+				}
 			} else if len(req.srvs) != 1 || req.srvs[0].Target != req.host || req.srvs[0].Port != req.port {
 				addf(&r.SRVConf.Errors, "Unexpected SRV record(s) for %q", name)
 			}

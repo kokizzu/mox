@@ -2580,7 +2580,7 @@ const domainDNSRecords = async (d) => {
 		client.DomainRecords(d),
 		client.ParseDomain(d),
 	]);
-	dom._kids(page, crumbs(crumblink('Mox Admin', '#'), crumblink('Domain ' + domainString(dnsdomain), '#domains/' + d), 'DNS Records'), dom.h1('Required DNS records'), dom.pre('pre', dom._class('literal'), (records || []).join('\n')), dom.br());
+	dom._kids(page, crumbs(crumblink('Mox Admin', '#'), crumblink('Domain ' + domainString(dnsdomain), '#domains/' + d), 'DNS Records'), dom.h1('Required DNS records'), dom.pre(dom._class('literal'), (records || []).join('\n')), dom.br());
 };
 const domainDNSCheck = async (d) => {
 	const [checks, dnsdomain] = await Promise.all([
@@ -2592,8 +2592,8 @@ const domainDNSCheck = async (d) => {
 		if ((r.Errors || []).length === 0 && (r.Warnings || []).length === 0) {
 			success = box(green, 'OK');
 		}
-		const errors = (r.Errors || []).length === 0 ? [] : box(red, dom.ul(style({ marginLeft: '1em' }), (r.Errors || []).map(s => dom.li(s))));
-		const warnings = (r.Warnings || []).length === 0 ? [] : box(yellow, dom.ul(style({ marginLeft: '1em' }), (r.Warnings || []).map(s => dom.li(s))));
+		const errors = (r.Errors || []).length === 0 ? [] : box(red, dom.ul((r.Errors || []).map(s => dom.li(s))));
+		const warnings = (r.Warnings || []).length === 0 ? [] : box(yellow, dom.ul((r.Warnings || []).map(s => dom.li(s))));
 		let instructions = null;
 		if (r.Instructions && r.Instructions.length > 0) {
 			instructions = dom.div(style({ margin: '.5ex 0' }));
